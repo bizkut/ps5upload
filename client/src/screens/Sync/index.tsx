@@ -135,7 +135,7 @@ function SyncProgress({ run, onCancel }: { run: SyncRun; onCancel: () => void })
         ? tr("sync_stage_delete", undefined, "Deleting")
         : tr("sync_stage_plan", undefined, "Planning / Verifying");
   const detail = id === "upload"
-    ? tr("sync_byte_progress", { done: formatBytes(done), total: formatBytes(total) }, "{done} / {total}")
+    ? `${formatBytes(done)} / ${formatBytes(total)}`
     : id === "delete"
       ? tr("sync_delete_progress", { done, total }, "{done} / {total} entries")
       : total > 0
