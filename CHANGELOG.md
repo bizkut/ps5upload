@@ -4,6 +4,22 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## Unreleased
+
+**Keep a PS5 folder in step with a folder on your computer.** The new
+**Sync** screen saves pairs — a folder here, a folder on a console — and
+**Sync now** uploads only what changed since the last sync, including
+patches that leave a file's size the same. Files that disappeared from
+your computer are listed and removed from the PS5 only after you confirm;
+exclude patterns keep PS5-only files safe. Made for games a PC launcher
+keeps updated when the PS5 runs the same files.
+
+- **Override never deleted anything.** The FAQ said it wiped the
+  destination first; it re-sends every file and leaves other files alone.
+  The FAQ now says so.
+
+---
+
 ## 5.41.0
 
 **Installs that the PS5 used to decline now go through.** On FW 13.60 the

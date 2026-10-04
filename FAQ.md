@@ -878,12 +878,34 @@ are credited on Resume, so already-allocated data is not charged twice.
 
 **Q: What happens when the destination already has files?**
 The app asks: **Override**, **Resume**, or **Cancel**.
-- **Override** — wipe destination and start fresh.
+- **Override** — re-send every file from your computer. Files with the
+  same name are replaced; anything else already in the destination is
+  left alone (nothing is deleted).
 - **Resume** — size-compare remote files to local; re-upload only
   what differs. Faster for re-running a big transfer.
 - **Cancel** — abort.
 
 Set **Settings → Always overwrite** if you want to skip the prompt.
+
+**Q: How do I keep a folder on the PS5 in step with a folder on my
+computer?** (e.g. a launcher keeps a game updated on your PC and the PS5
+runs the same files)
+Use **Sync**. Save a pair — a folder on your computer and a folder on
+the PS5 — and press **Sync now** whenever the PC side changes:
+- New and changed files are uploaded. A file counts as changed when its
+  size or modified time differs from the last sync, so same-size patches
+  are caught. The first sync of a pair (or **Full verify**) compares
+  same-size files by BLAKE3 hash instead, which is slower.
+- Files on the PS5 that no longer exist on your computer are listed
+  first and deleted only after you confirm. Exclude patterns protect
+  PS5-only files (for example `fakelib` or anything you added on the
+  console); symlinks on the PS5 are never deleted.
+- Sync is one-way, computer → PS5. Changes made on the PS5 are not
+  copied back, and a PS5 file edited without changing its size is not
+  noticed unless you run **Full verify**.
+- Sync refuses a PS5 destination that is a whole drive (`/data`,
+  `/mnt/usb0`, …) and refuses to delete anything when the computer
+  folder is empty, so a disconnected drive can't wipe the PS5 copy.
 
 **Q: Can I upload a disk image?**
 Yes. Drop any `.exfat` or `.ffpkg` image. After upload, open the

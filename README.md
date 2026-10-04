@@ -58,6 +58,11 @@
   walk away. Every running row shows live MiB/s and ETA; done
   rows show the wall-clock-average rate so you can spot a slow
   destination. Queue state survives app restarts.
+- **Folder sync** — save a computer-folder → PS5-folder pair and
+  press Sync now to send only what changed since the last sync
+  (size or modified time, BLAKE3 on the first run). Files gone from
+  the computer are removed from the PS5 only after you confirm the
+  list; exclude patterns protect PS5-only files. One-way, PC → PS5.
 - **Compressed archive uploads (`.zip` / `.7z` / `.rar`)** — keep a game
   dump as a single archive on your PC (less disk, easier to move) and
   upload it directly. ps5upload decompresses on the host and streams
