@@ -4,6 +4,21 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 5.42.1
+
+- **Folder Sync shows up in Tasks.** A running sync appears in the Tasks
+  tab and the activity bar with its stage (planning, uploading, deleting)
+  and progress, and can be cancelled from there; finished syncs are kept
+  in Full history. Your computer stays awake while a sync runs, as it
+  does for uploads.
+- **Task rows count files and items as files and items.** Progress that
+  isn't bytes (a bulk delete, say) used to read "0 B / 3 B".
+- **"Preparing… compressed archives" only on uploads.** Running deletes,
+  moves and other non-upload rows in Full history no longer show the
+  archive-extraction hint.
+
+---
+
 ## 5.42.0
 
 **Keep a PS5 folder in step with a folder on your computer.** The new
