@@ -17,6 +17,15 @@ keeps updated when the PS5 runs the same files.
 - **Override never deleted anything.** The FAQ said it wiped the
   destination first; it re-sends every file and leaves other files alone.
   The FAQ now says so.
+- **Syncs show up in Tasks.** A running sync appears in the Tasks tab and
+  the activity bar with its stage (planning, uploading, deleting) and
+  progress, and can be cancelled from there; finished syncs are kept in
+  Full history. Your computer stays awake while a sync runs.
+- **Task rows count files and items as files and items.** Progress that
+  isn't bytes (a bulk delete, say) used to read "0 B / 3 B".
+- **"Preparing… compressed archives" only on uploads.** Running deletes,
+  moves and other non-upload rows in Full history no longer show the
+  archive-extraction hint.
 
 ---
 
