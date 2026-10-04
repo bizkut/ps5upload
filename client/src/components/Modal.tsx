@@ -70,6 +70,14 @@ export function Modal({
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  // Callers usually pass an inline onClose. Reading it through a ref keeps the
+  // focus effect below keyed on `open` alone: re-running it per render would
+  // restore focus to the trigger and refocus the first control on every
+  // keystroke in a field inside the modal.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   // Lock background scroll while open so a wheel/touch over the scrim can't
   // scroll the page behind it (this modal renders inline, so its scrim's
@@ -97,7 +105,7 @@ export function Modal({
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", handler);
@@ -109,7 +117,7 @@ export function Modal({
         queueMicrotask(() => prev.focus({ preventScroll: true }));
       }
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
