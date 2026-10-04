@@ -49,6 +49,8 @@ export function shortLabel(kind: TaskKind): string {
     case "upload-dir":
     case "upload-archive":
       return "Upload";
+    case "folder-sync":
+      return "Sync";
     case "download":
       return "Download";
     case "fs-copy":
@@ -97,6 +99,7 @@ export function shortLabel(kind: TaskKind): string {
 export function routeForTask(task: Task): string {
   const k = task.kind;
   if (k.startsWith("upload-")) return "/upload";
+  if (k === "folder-sync") return "/sync";
   if (k.startsWith("fs-") || k === "download") return "/file-system";
   if (k.startsWith("pkg-") || k === "install-batch") return "/install-package";
   if (k.startsWith("backup-")) return "/backup";

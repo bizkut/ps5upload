@@ -24,7 +24,7 @@ import { effectiveUploadStreams } from "../../lib/uploadStreams";
 import { useConnectionStore } from "../../state/connection";
 import { useTr, type Translator } from "../../state/lang";
 import { pickLocalPath } from "../../state/localPicker";
-import { isLocalSyncPath, syncPairRunKey, useSyncPairsStore } from "../../state/syncPairs";
+import { isLocalSyncPath, syncPairRunKey, syncRunStage, useSyncPairsStore } from "../../state/syncPairs";
 import type { SyncPair, SyncPairResult, SyncRun } from "../../state/syncPairs";
 import { useUploadQueueStore } from "../../state/uploadQueue";
 import { useUploadSettingsStore } from "../../state/uploadSettings";
@@ -126,17 +126,14 @@ function PreviewDetails({ preview }: { preview: SyncPreview }) {
 
 function SyncProgress({ run, onCancel }: { run: SyncRun; onCancel: () => void }) {
   const tr = useTr();
-  const stage = run.snapshot?.stage;
-  const id = stage?.id ?? "plan";
-  const label = !run.jobId
+  const { id, done, total } = syncRunStage(run);
+  const label = id === "start"
     ? tr("sync_starting", undefined, "Starting sync…")
     : id === "upload"
       ? tr("sync_stage_upload", undefined, "Uploading")
       : id === "delete"
         ? tr("sync_stage_delete", undefined, "Deleting")
         : tr("sync_stage_plan", undefined, "Planning / Verifying");
-  const done = stage?.done ?? run.snapshot?.bytes_sent ?? 0;
-  const total = stage?.total ?? run.snapshot?.total_bytes ?? 0;
   const detail = id === "upload"
     ? tr("sync_byte_progress", { done: formatBytes(done), total: formatBytes(total) }, "{done} / {total}")
     : id === "delete"

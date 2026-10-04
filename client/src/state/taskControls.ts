@@ -1,6 +1,7 @@
 import { useFpkgConversion } from "./fpkgConversion";
 import { useFsBulkOpStore } from "./fsBulkOp";
 import { retryInstallReverify } from "./pkgLibrary";
+import { syncPairRunKey, useSyncPairsStore } from "./syncPairs";
 import { useTransferStore } from "./transfer";
 import { useUploadQueueStore } from "./uploadQueue";
 import { isTerminal, type Task } from "./tasks";
@@ -52,6 +53,11 @@ export function taskCapabilities(task: Task): TaskCapabilities {
     // (the Recheck action), which is what "retry" means for this owner.
     return { ...none, canRetry: task.status === "awaiting" };
   }
+  if (control.owner === "folder-sync") {
+    // No retry here: a new run needs a fresh preview and deletion approval.
+    const run = useSyncPairsStore.getState().runs[syncPairRunKey(control.host, control.pairId)];
+    return { ...none, canCancel: !isTerminal(task.status) && !!run && !run.cancelling };
+  }
 
   const item = useUploadQueueStore.getState().items.find(
     (candidate) => candidate.id === control.itemId,
@@ -88,6 +94,11 @@ export async function commandTask(task: Task, command: TaskCommand): Promise<boo
     }
     if (control.owner === "link-download") {
       await invoke("pkg_remote_download_cancel", { id: control.downloadId });
+      return true;
+    }
+    if (control.owner === "folder-sync") {
+      if (!taskCapabilities(task).canCancel) return false;
+      await useSyncPairsStore.getState().cancelRun(control.host, control.pairId);
       return true;
     }
     useUploadQueueStore.getState().cancelItem(control.itemId);

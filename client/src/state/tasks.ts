@@ -37,6 +37,8 @@ export type TaskKind =
   | "upload-file"
   | "upload-dir"
   | "upload-archive"
+  // one-way PC → PS5 folder sync (engine job: plan, upload, delete)
+  | "folder-sync"
   | "download"
   // filesystem ops
   | "fs-delete"
@@ -124,7 +126,9 @@ export type TaskControlRef =
   // through this computer"). Cancel stops the engine's download.
   | { owner: "link-download"; downloadId: string }
   // A Convert or .ffpfsc run; Cancel stops its build job.
-  | { owner: "fpkg-convert" };
+  | { owner: "fpkg-convert" }
+  // A Folder Sync run; Cancel stops its engine job. One run per console.
+  | { owner: "folder-sync"; host: string; pairId: string };
 
 /** Per-kind specifics. Kept loose (record of string→unknown) so each
  *  feature can store what it needs without forcing a union. The typed

@@ -27,8 +27,10 @@ import {
 } from "./fsBulkOp";
 import { installLibraryTaskBridge } from "./libraryTaskBridge";
 import { useTransferStore, IDLE_PHASE } from "./transfer";
+import { syncRunStage, useSyncPairsStore, type SyncRunStageId } from "./syncPairs";
 import { isUploadItem, useUploadQueueStore } from "./uploadQueue";
-import { useTaskStore, type TaskKind } from "./tasks";
+import { useTaskStore, type TaskKind, type TaskProgressUnit } from "./tasks";
+import { trStatic } from "../lib/trStatic";
 import { hostOf } from "../lib/addr";
 
 let installed = false;
@@ -416,6 +418,79 @@ export function installTaskWiring() {
     }
   });
 
+  // ── Folder Sync runs ──────────────────────────────────────────────
+  // One run per console, keyed by syncPairRunKey. The sync store records
+  // the pair's result before it drops the run, so the result is already
+  // there when the run disappears.
+  const syncTaskIds = new Map<string, string>();
+  useSyncPairsStore.subscribe((state, prev) => {
+    if (state.runs === prev.runs) return;
+    const tasks = useTaskStore.getState();
+    for (const [key, run] of Object.entries(state.runs)) {
+      const old = prev.runs[key];
+      const pair = state.pairsByHost[run.host]?.find((p) => p.id === run.pairId);
+      let taskId = syncTaskIds.get(key);
+      if (!old || taskId === undefined) {
+        taskId = tasks.registerTask({
+          kind: "folder-sync",
+          origin: "sync",
+          label: `Sync: ${pair?.name ?? run.pairId}`,
+          detail: pair ? `${pair.srcDir} → ${pair.destRoot}` : undefined,
+          consoleId: run.host,
+          status: "running",
+          control: { owner: "folder-sync", host: run.host, pairId: run.pairId },
+        });
+        syncTaskIds.set(key, taskId);
+      }
+      if (old && old.snapshot === run.snapshot && old.jobId === run.jobId) continue;
+      const stage = syncRunStage(run);
+      tasks.updateTask(taskId, {
+        engineJobId: run.jobId,
+        stage: SYNC_STAGE_LABEL[stage.id](),
+        progress: stage.total > 0
+          ? { current: stage.done, total: stage.total, unit: SYNC_STAGE_UNIT[stage.id] }
+          : undefined,
+      });
+    }
+    for (const [key, old] of Object.entries(prev.runs)) {
+      if (state.runs[key]) continue;
+      const taskId = syncTaskIds.get(key);
+      syncTaskIds.delete(key);
+      if (taskId === undefined) continue;
+      const result = state.pairsByHost[old.host]?.find((p) => p.id === old.pairId)?.lastResult;
+      if (result?.status === "done") {
+        // Replace the last mid-stage sample: a finished row must not read 33%.
+        tasks.finishTask(taskId, "done", {
+          progress: result.bytes_sent > 0
+            ? { current: result.bytes_sent, total: result.bytes_sent, unit: "bytes" }
+            : undefined,
+        });
+      } else if (old.cancelling || !result) {
+        tasks.finishTask(taskId, "cancelled", {
+          lastError: { code: "USER_CANCELLED", message: "cancelled by user", recoverable: false },
+        });
+      } else {
+        tasks.finishTask(taskId, "failed", {
+          lastError: { code: "SYNC_FAILED", message: result.error, recoverable: true },
+        });
+      }
+    }
+  });
+
   // ── Library actions (activity log only) ───────────────────────────
   installLibraryTaskBridge();
 }
+
+const SYNC_STAGE_LABEL: Record<SyncRunStageId, () => string> = {
+  start: () => trStatic("sync_starting", "Starting sync…"),
+  plan: () => trStatic("sync_stage_plan", "Planning / Verifying"),
+  upload: () => trStatic("sync_stage_upload", "Uploading"),
+  delete: () => trStatic("sync_stage_delete", "Deleting"),
+};
+
+const SYNC_STAGE_UNIT: Record<SyncRunStageId, TaskProgressUnit> = {
+  start: "files",
+  plan: "files",
+  upload: "bytes",
+  delete: "items",
+};

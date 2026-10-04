@@ -6,12 +6,14 @@ import {
 } from "./fsBulkOp";
 import { useTransferStore, IDLE_PHASE } from "./transfer";
 import { isUploadItem, useUploadQueueStore } from "./uploadQueue";
+import { syncRunStage, useSyncPairsStore } from "./syncPairs";
 import {
   useActivityHistoryStore,
   type ActivityKind,
   type ActivityPhase,
 } from "./activityHistory";
 import { setTransferKeepAwake } from "../lib/keepAwakeHold";
+import { transferAddr } from "../lib/addr";
 
 /**
  * Subscribes to the per-feature stores (transfer, FS bulk, FS
@@ -62,12 +64,16 @@ export function installActivityWiring() {
       useUploadQueueStore.getState().items.some((it) => it.status === "running")
     )
       return true;
+    // A folder sync is an upload too (and its plan/delete stages talk to the
+    // console for minutes on a large game).
+    if (Object.keys(useSyncPairsStore.getState().runs).length > 0) return true;
     return false;
   };
   const reconcileKeepAwake = () => setTransferKeepAwake(anyTransferActive());
   useTransferStore.subscribe(reconcileKeepAwake);
   useFsDownloadOpStore.subscribe(reconcileKeepAwake);
   useUploadQueueStore.subscribe(reconcileKeepAwake);
+  useSyncPairsStore.subscribe(reconcileKeepAwake);
   // Subscriptions only fire on CHANGE, so reconcile once now in case a
   // transfer is already in flight when wiring installs (e.g. the upload
   // queue auto-resumed from a hydrate before this ran).
@@ -420,6 +426,52 @@ export function installActivityWiring() {
           error: "removed from queue",
         });
         uploadQueueActivityIds.delete(itemId);
+      }
+    }
+  });
+
+  // ── Folder Sync runs ─────────────────────────────────────────────
+  // One run per console. The sync store records the pair's result before
+  // it drops the run, so the outcome is readable when the run disappears.
+  const syncActivityIds = new Map<string, string>();
+  useSyncPairsStore.subscribe((state, prev) => {
+    if (state.runs === prev.runs) return;
+    const history = useActivityHistoryStore.getState();
+    for (const [key, run] of Object.entries(state.runs)) {
+      const old = prev.runs[key];
+      const activityId = syncActivityIds.get(key);
+      if (!old || activityId === undefined) {
+        const pair = state.pairsByHost[run.host]?.find((p) => p.id === run.pairId);
+        syncActivityIds.set(
+          key,
+          history.start("folder-sync", `Sync: ${pair?.name ?? run.pairId}`, {
+            fromPath: pair?.srcDir,
+            toPath: pair?.destRoot,
+            addr: transferAddr(run.host),
+          }),
+        );
+        continue;
+      }
+      if (old.snapshot === run.snapshot) continue;
+      // Only the upload stage counts bytes; plan/delete counters are files
+      // and entries, which the history row would render as bytes.
+      const stage = syncRunStage(run);
+      if (stage.id === "upload") {
+        history.update(activityId, { bytes: stage.done, totalBytes: stage.total });
+      }
+    }
+    for (const [key, old] of Object.entries(prev.runs)) {
+      if (state.runs[key]) continue;
+      const activityId = syncActivityIds.get(key);
+      syncActivityIds.delete(key);
+      if (activityId === undefined) continue;
+      const result = state.pairsByHost[old.host]?.find((p) => p.id === old.pairId)?.lastResult;
+      if (result?.status === "done") {
+        history.finish(activityId, "done", { bytes: result.bytes_sent });
+      } else if (old.cancelling || !result) {
+        history.finish(activityId, "stopped", { error: "cancelled by user" });
+      } else {
+        history.finish(activityId, "failed", { error: result.error });
       }
     }
   });
