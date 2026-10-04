@@ -4,7 +4,7 @@ What's new in ps5upload, written for humans.
 
 ---
 
-## Unreleased
+## 5.42.0
 
 **Keep a PS5 folder in step with a folder on your computer.** The new
 **Sync** screen saves pairs — a folder here, a folder on a console — and
