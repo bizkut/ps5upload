@@ -33,6 +33,7 @@ import HomeScreen from "./screens/Home";
 
 const MoreScreen = lazyWithReload(() => import("./screens/More"));
 const UploadScreen = lazyWithReload(() => import("./screens/Upload"));
+const SyncScreen = lazyWithReload(() => import("./screens/Sync"));
 const InstallPackageScreen = lazyWithReload(() => import("./screens/InstallPackage"));
 const ConvertScreen = lazyWithReload(() => import("./screens/FpkgConvert"));
 const GamesScreen = lazyWithReload(() => import("./screens/Games"));
@@ -144,6 +145,14 @@ export default function App() {
           element={
             <Suspense fallback={<ScreenLoader />}>
               <UploadScreen />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/sync"
+          element={
+            <Suspense fallback={<ScreenLoader />}>
+              <SyncScreen />
             </Suspense>
           }
         />

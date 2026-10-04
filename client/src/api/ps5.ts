@@ -663,6 +663,89 @@ export async function startTransferDirReconcile(
   return res.job_id;
 }
 
+// ─── One-way PC → PS5 folder sync ──────────────────────────────────────
+
+export interface SyncDeleteEntry {
+  /** Relative path under the destination; forwarded unchanged on approval. */
+  path: string;
+  kind: "file" | "dir";
+  /** Recursive size and regular-file count for directories. */
+  bytes: number;
+  files: number;
+  /** Wrong-kind entries must be removed before the PC counterpart is sent. */
+  blocks_upload?: boolean;
+}
+
+export interface SyncPreview {
+  busy: boolean;
+  has_manifest: boolean;
+  to_send_count: number;
+  to_send_bytes: number;
+  /** At most 64 relative paths. Unlike this sample, to_delete is complete. */
+  sample_to_send: string[];
+  to_verify_count: number;
+  to_verify_bytes: number;
+  unchanged_count: number;
+  unchanged_bytes: number;
+  to_delete: SyncDeleteEntry[];
+  delete_bytes: number;
+  delete_files: number;
+  kept_count: number;
+  /** PC paths occupied by protected PS5 entries; sync cannot run until resolved. */
+  blocked?: string[];
+}
+
+export interface SyncSummary {
+  deleted_count: number;
+  deleted_bytes: number;
+  delete_skipped: string[];
+  delete_failed: { path: string; error: string }[];
+  verified_count: number;
+  manifest_saved: boolean;
+}
+
+/** Preview never hashes or changes files. Same-size files needing a BLAKE3
+ *  comparison are reported separately and resolved by the run. */
+export async function syncPreview(
+  srcDir: string,
+  destRoot: string,
+  addr: string,
+  excludes: string[] = [],
+  verify = false,
+): Promise<SyncPreview> {
+  return invoke<SyncPreview>("sync_preview", {
+    req: { src_dir: srcDir, dest_root: destRoot, addr, excludes, verify },
+  });
+}
+
+/** Start a sync after preview approval. Only these exact relative paths may
+ *  be deleted; the engine intersects them with a freshly computed plan. */
+export async function startSync(
+  srcDir: string,
+  destRoot: string,
+  addr: string,
+  approvedDeletes: string[],
+  excludes: string[] = [],
+  verify = false,
+  bandwidthCapMbps?: number,
+  streams?: number,
+): Promise<string> {
+  const res = await invoke<{ job_id: string }>("sync_run", {
+    req: {
+      src_dir: srcDir,
+      dest_root: destRoot,
+      addr,
+      excludes,
+      verify,
+      approved_deletes: approvedDeletes,
+      bandwidth_cap_mbps:
+        bandwidthCapMbps && bandwidthCapMbps > 0 ? bandwidthCapMbps : null,
+      streams: streams && streams > 1 ? streams : null,
+    },
+  });
+  return res.job_id;
+}
+
 // ─── Cross-session resume tx_id persistence ─────────────────────────────
 //
 // The Tauri side keeps a JSON store of (host, src, dest) → tx_id_hex so
@@ -4071,9 +4154,9 @@ export interface PlannedFile {
   size: number;
 }
 
-/** Where a staged job (an FPKG build) stands: its stage and that stage's own bytes. */
+/** A staged job's current stage and that stage's own progress counters. */
 export interface JobStageSnapshot {
-  /** "check" | "plan" | "compress" | "write" | "verify" for a build. */
+  /** Build stages, or "plan" | "upload" | "delete" for folder sync. */
   id: string;
   index: number;
   count: number;
@@ -4083,7 +4166,7 @@ export interface JobStageSnapshot {
 
 export interface JobSnapshot {
   status: JobStatus;
-  /** Present on a running job that reports stages (an FPKG build). */
+  /** Present on a running job that reports stages (build or folder sync). */
   stage?: JobStageSnapshot;
   /** A finished FPKG build's content id (the transfer id field, reused). */
   tx_id_hex?: string;
@@ -4131,6 +4214,8 @@ export interface JobSnapshot {
   bytes_finalized?: number;
   /** Files actually sent (Done only). */
   files_sent?: number;
+  /** Folder-sync completion details; absent on other transfer jobs. */
+  sync?: SyncSummary;
   shards_sent?: number;
   dest?: string;
   error?: string;

@@ -1614,3 +1614,292 @@ fn transfer_dir_from_a_source_fs_arrives_byte_for_byte() {
         assert!(got == bytes, "{rel} differs");
     }
 }
+
+// ─── Folder sync ─────────────────────────────────────────────────────────────
+
+#[test]
+fn folder_sync_delta_and_only_approved_deletions() {
+    use ps5upload_core::sync::{
+        apply_deletes, plan_sync, resolve_verifications, walk_local_sync, walk_remote_sync,
+        SyncManifest,
+    };
+    use ps5upload_core::transfer::{transfer_file_list, FileListEntry};
+    use std::sync::atomic::AtomicBool;
+
+    let tmp = tempdir();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    for (rel, bytes) in [
+        ("new.bin", b"new-file".as_slice()),
+        ("sub/changed.bin", b"NEW-data".as_slice()),
+        ("unchanged.bin", b"same-data".as_slice()),
+    ] {
+        std::fs::write(tmp.path().join(rel), bytes).unwrap();
+    }
+    let srv = MockServer::start();
+    let dest = "/data/homebrew/SyncGame";
+    {
+        let mut state = srv.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (rel, bytes) in [
+            ("sub/changed.bin", b"OLD-data".as_slice()),
+            ("unchanged.bin", b"same-data".as_slice()),
+            ("old/a.bin", b"old-a".as_slice()),
+            ("old/sub/b.bin", b"old-b".as_slice()),
+            ("unapproved.bin", b"keep-me".as_slice()),
+        ] {
+            state
+                .applied
+                .insert(format!("{dest}/{rel}"), bytes.to_vec());
+        }
+    }
+    let local = walk_local_sync(tmp.path(), &[]).unwrap();
+    let remote = walk_remote_sync(&srv.addr, dest).unwrap();
+    let mut plan = plan_sync(&local, &remote, None, &[], false);
+    assert_eq!(plan.to_send.len(), 1);
+    assert_eq!(plan.to_verify.len(), 2);
+    assert_eq!(
+        plan.to_delete
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        ["old", "unapproved.bin"]
+    );
+    assert_eq!((plan.to_delete[0].bytes, plan.to_delete[0].files), (10, 2));
+    let mut progress = Vec::new();
+    assert_eq!(
+        resolve_verifications(&srv.addr, tmp.path(), dest, &mut plan, |done, total| {
+            progress.push((done, total));
+        }),
+        2
+    );
+    assert_eq!(progress, [(0, 2), (1, 2), (2, 2)]);
+    assert_eq!(
+        plan.to_send
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        ["new.bin", "sub/changed.bin"]
+    );
+    assert_eq!(plan.unchanged_count, 1);
+    let entries: Vec<FileListEntry> = plan
+        .to_send
+        .iter()
+        .map(|file| FileListEntry {
+            src: tmp
+                .path()
+                .join(&file.rel_path)
+                .to_string_lossy()
+                .into_owned(),
+            dest: format!("{dest}/{}", file.rel_path),
+        })
+        .collect();
+    let uploaded = transfer_file_list(
+        &TransferConfig::new(&srv.addr),
+        random_tx_id(),
+        dest,
+        &entries,
+    )
+    .unwrap();
+    assert_eq!(uploaded.bytes_sent, plan.bytes_to_send);
+    let deleted = apply_deletes(
+        &srv.addr,
+        dest,
+        &plan.to_delete,
+        &["old".into(), "not-in-fresh-plan".into()],
+        &AtomicBool::new(false),
+    );
+    assert_eq!(
+        deleted
+            .deleted
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        ["old"]
+    );
+    assert_eq!(deleted.skipped, ["unapproved.bin"]);
+    assert!(deleted.failed.is_empty());
+    let manifest = SyncManifest {
+        version: 1,
+        src_dir: tmp.path().to_string_lossy().into_owned(),
+        dest_root: dest.into(),
+        host: "127.0.0.1".into(),
+        files: local.files.clone(),
+    };
+    let after = walk_remote_sync(&srv.addr, dest).unwrap();
+    let replanned = plan_sync(&local, &after, Some(&manifest), &[], false);
+    assert!(replanned.to_send.is_empty());
+    assert!(replanned.to_verify.is_empty());
+    assert_eq!(replanned.unchanged_count, 3);
+    assert_eq!(
+        replanned
+            .to_delete
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        ["unapproved.bin"]
+    );
+    let state = srv.state.lock().unwrap_or_else(|e| e.into_inner());
+    for rel in local.files.keys() {
+        assert_eq!(
+            state.applied.get(&format!("{dest}/{rel}")).unwrap(),
+            &std::fs::read(tmp.path().join(rel)).unwrap(),
+        );
+    }
+    assert_eq!(
+        state
+            .applied
+            .get(&format!("{dest}/unapproved.bin"))
+            .unwrap(),
+        b"keep-me"
+    );
+    assert!(!state
+        .applied
+        .keys()
+        .any(|path| path.starts_with(&format!("{dest}/old/"))));
+}
+
+#[test]
+fn folder_sync_remote_walk_paginates_and_never_ignores_listing_failures() {
+    use ps5upload_core::sync::walk_remote_sync;
+
+    let srv = MockServer::start();
+    let dest = "/data/homebrew/PagedGame";
+    assert!(walk_remote_sync(&srv.addr, dest).unwrap().files.is_empty());
+    let errno_named_file = "/data/homebrew/Game_errno_2";
+    srv.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied
+        .insert(errno_named_file.into(), vec![1]);
+    assert!(
+        walk_remote_sync(&srv.addr, errno_named_file).is_err(),
+        "errno-looking filenames must not hide ENOTDIR"
+    );
+    {
+        let mut state = srv.state.lock().unwrap_or_else(|e| e.into_inner());
+        for index in 0..600 {
+            state
+                .applied
+                .insert(format!("{dest}/f{index:04}.bin"), vec![1, 2, 3]);
+        }
+        state
+            .applied
+            .insert(format!("{dest}/nested/a.bin"), vec![4]);
+    }
+    let remote = walk_remote_sync(&srv.addr, dest).unwrap();
+    assert_eq!(remote.files.len(), 601);
+    assert!(remote.dirs.contains("nested"));
+    {
+        let mut state = srv.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.list_dir_errors.insert(
+            format!("{dest}/nested"),
+            "fs_list_dir_opendir_errno_2".into(),
+        );
+    }
+    assert!(
+        walk_remote_sync(&srv.addr, dest).is_err(),
+        "only root ENOENT may be empty"
+    );
+    {
+        let mut state = srv.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .list_dir_errors
+            .insert(dest.into(), "fs_list_dir_opendir_errno_20".into());
+    }
+    assert!(
+        walk_remote_sync(&srv.addr, dest).is_err(),
+        "ENOTDIR is not ENOENT"
+    );
+}
+
+#[test]
+fn folder_sync_hash_error_resends_and_cancel_preserves_approved_paths() {
+    use ps5upload_core::sync::{
+        apply_deletes, plan_sync, resolve_verifications, walk_local_sync, walk_remote_sync,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    let tmp = tempdir();
+    std::fs::write(tmp.path().join("file.bin"), b"same-size").unwrap();
+    let srv = MockServer::start();
+    let dest = "/data/homebrew/HashGame";
+    {
+        let mut state = srv.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .applied
+            .insert(format!("{dest}/file.bin"), b"same-size".to_vec());
+        state
+            .applied
+            .insert(format!("{dest}/stale.bin"), b"stale".to_vec());
+    }
+    let local = walk_local_sync(tmp.path(), &[]).unwrap();
+    let remote = walk_remote_sync(&srv.addr, dest).unwrap();
+    let mut plan = plan_sync(&local, &remote, None, &[], false);
+    srv.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied
+        .remove(&format!("{dest}/file.bin"));
+    assert_eq!(
+        resolve_verifications(&srv.addr, tmp.path(), dest, &mut plan, |_, _| {}),
+        1
+    );
+    assert_eq!(plan.to_send.len(), 1);
+    assert_eq!(plan.unchanged_count, 0);
+    let result = apply_deletes(
+        &srv.addr,
+        dest,
+        &plan.to_delete,
+        &["stale.bin".into()],
+        &AtomicBool::new(true),
+    );
+    assert!(result.deleted.is_empty());
+    assert_eq!(result.skipped, ["stale.bin"]);
+    assert!(srv
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied
+        .contains_key(&format!("{dest}/stale.bin")));
+    let denied = apply_deletes(
+        &srv.addr,
+        "/system/Game",
+        &plan.to_delete,
+        &["stale.bin".into()],
+        &AtomicBool::new(false),
+    );
+    assert_eq!(denied.failed.len(), 1);
+    assert_eq!(denied.failed[0].path, "stale.bin");
+}
+
+#[test]
+fn folder_sync_walks_fail_closed_and_respect_depth_limit() {
+    use ps5upload_core::sync::{walk_local_sync, walk_remote_sync};
+
+    let tmp = tempdir();
+    std::fs::write(tmp.path().join("keep.bin"), b"keep").unwrap();
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
+    std::fs::write(tmp.path().join(".git/HEAD"), b"excluded").unwrap();
+    let inventory = walk_local_sync(tmp.path(), &[".git/**".into()]).unwrap();
+    assert_eq!(
+        inventory
+            .files
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["keep.bin"]
+    );
+    assert!(!inventory.dirs.contains(".git"));
+    assert!(walk_local_sync(&tmp.path().join("missing"), &[]).is_err());
+    let srv = MockServer::start();
+    let dest = "/data/homebrew/DeepGame";
+    let deep = format!("{dest}/{}file.bin", "dir/".repeat(65));
+    srv.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied
+        .insert(deep, vec![1]);
+    assert!(walk_remote_sync(&srv.addr, dest)
+        .unwrap_err()
+        .to_string()
+        .contains("depth exceeds 64"));
+}

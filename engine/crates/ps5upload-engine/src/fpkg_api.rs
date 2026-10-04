@@ -414,6 +414,7 @@ pub(crate) async fn fpkg_build_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: None,
+                        sync: None,
                     },
                 );
             }
@@ -632,6 +633,7 @@ pub(crate) async fn ffpfsc_compress_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: None,
+                        sync: None,
                     },
                 );
             }
@@ -880,6 +882,7 @@ pub(crate) async fn fpkg_extract_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: None,
+                        sync: None,
                     },
                 );
             }

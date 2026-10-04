@@ -1242,7 +1242,7 @@ static RECONCILE_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 /// RAII reservation of a reconcile's key set. Drop releases every key and wakes
 /// any reconcile waiting on a now-free key.
-struct ReconcileGate {
+pub(crate) struct ReconcileGate {
     keys: Vec<String>,
 }
 
@@ -1257,7 +1257,7 @@ impl Drop for ReconcileGate {
 /// Reserve `keys` atomically. `block=true` (real upload) waits until every key
 /// is free; `block=false` (preview) bails immediately with `reconcile_busy` if
 /// any key is contended — before the expensive local walk.
-fn acquire_reconcile_gate(keys: Vec<String>, block: bool) -> Result<ReconcileGate> {
+pub(crate) fn acquire_reconcile_gate(keys: Vec<String>, block: bool) -> Result<ReconcileGate> {
     let mut held = RECONCILE_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let conflict = keys.iter().any(|k| held.contains(k));
@@ -1628,7 +1628,7 @@ pub fn reconcile(
 
 /// Stream a local file through BLAKE3 in 64 KiB chunks. Mirrors the
 /// payload's FS_HASH streaming behavior so hex outputs compare directly.
-fn blake3_file(path: &std::path::Path) -> Result<String> {
+pub(crate) fn blake3_file(path: &std::path::Path) -> Result<String> {
     use std::io::Read;
     let mut hasher = blake3::Hasher::new();
     let mut f = std::fs::File::open(path)

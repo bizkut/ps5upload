@@ -315,6 +315,7 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: None,
+                        sync: None,
                     },
                 );
             }

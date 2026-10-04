@@ -13,7 +13,7 @@ use ftx2_proto::{
     SHARD_FLAG_PACKED, TX_FLAG_RESUME,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
@@ -52,6 +52,10 @@ pub(crate) struct MockState {
     pub(crate) commands: u64,
     /// Applied files: dest_path → data
     pub(crate) applied: HashMap<String, Vec<u8>>,
+    /// Explicit/previously observed directories, including empty directories.
+    pub(crate) dirs: BTreeSet<String>,
+    /// Per-path listing failures for destructive-sync safety tests.
+    pub(crate) list_dir_errors: HashMap<String, String>,
     /// JSON body to return for FS_LIST_VOLUMES. Tests can override this via
     /// `srv.state().lock().unwrap().volumes_json = ...` to simulate hot-plug
     /// or unusual configurations.
@@ -71,6 +75,8 @@ impl Default for MockState {
             txs: HashMap::new(),
             commands: 0,
             applied: HashMap::new(),
+            dirs: BTreeSet::new(),
+            list_dir_errors: HashMap::new(),
             volumes_json: DEFAULT_VOLUMES_JSON.to_string(),
             drop_after_shards: None,
             shell_sessions: HashMap::new(),
@@ -235,6 +241,147 @@ fn handle_connection_inner(mut stream: TcpStream, state: Arc<Mutex<MockState>>) 
                 let st = state.lock().unwrap();
                 let body = format!(r#"{{"active_transactions":{}}}"#, st.txs.len());
                 send_frame(&mut stream, FrameType::StatusAck, body.as_bytes());
+            }
+
+            // ── Filesystem management ────────────────────────────────────────
+            FrameType::FsListDir => {
+                let mut body = vec![0; hdr.body_len as usize];
+                if !read_exact(&mut stream, &mut body) {
+                    return;
+                }
+                let json = String::from_utf8_lossy(&body);
+                let path = extract_json_str(&json, "path").unwrap_or_default();
+                if !path.starts_with('/') || path.split('/').any(|c| c == "." || c == "..") {
+                    send_error(&mut stream, "fs_list_dir_bad_path");
+                    continue;
+                }
+                let path = normalized_mock_path(&path);
+                let offset = extract_json_u64(&json, "offset").unwrap_or(0);
+                let limit = extract_json_u64(&json, "limit")
+                    .filter(|&n| n > 0 && n < 1024)
+                    .unwrap_or(256)
+                    .min(256);
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(error) = st.list_dir_errors.get(&path) {
+                    send_error(&mut stream, error);
+                    continue;
+                }
+                let dirs = mock_directories(&st);
+                if !dirs.contains(&path) {
+                    let error = if st.applied.contains_key(&path) {
+                        "fs_list_dir_opendir_errno_20"
+                    } else {
+                        "fs_list_dir_opendir_errno_2"
+                    };
+                    send_error(&mut stream, error);
+                    continue;
+                }
+                st.dirs.extend(dirs.iter().cloned());
+                let prefix = if path == "/" {
+                    "/".into()
+                } else {
+                    format!("{path}/")
+                };
+                let mut children = BTreeMap::new();
+                for dir in &dirs {
+                    if let Some(name) = dir.strip_prefix(&prefix) {
+                        if !name.is_empty() && !name.contains('/') {
+                            children.insert(name, ("dir", 0));
+                        }
+                    }
+                }
+                for (file, data) in &st.applied {
+                    if let Some(name) = file.strip_prefix(&prefix) {
+                        if !name.is_empty() && !name.contains('/') {
+                            children.insert(name, ("file", data.len() as u64));
+                        }
+                    }
+                }
+                let total = children.len() as u64;
+                let entries: Vec<String> = children
+                    .into_iter()
+                    .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+                    .take(limit as usize)
+                    .map(|(name, (kind, size))| {
+                        format!(
+                            r#"{{"name":"{}","kind":"{kind}","size":{size},"mtime":0}}"#,
+                            json_escape(name)
+                        )
+                    })
+                    .collect();
+                let returned = entries.len() as u64;
+                let truncated = offset + returned < total;
+                let scanned = (offset + returned).min(total);
+                let response = format!(
+                    r#"{{"path":"{}","entries":[{}],"truncated":{truncated},"total_scanned":{scanned},"returned":{returned}}}"#,
+                    json_escape(&path),
+                    entries.join(",")
+                );
+                drop(st);
+                send_frame(&mut stream, FrameType::FsListDirAck, response.as_bytes());
+            }
+            FrameType::FsHash => {
+                let mut body = vec![0; hdr.body_len as usize];
+                if !read_exact(&mut stream, &mut body) {
+                    return;
+                }
+                let json = String::from_utf8_lossy(&body);
+                let path = extract_json_str(&json, "path").unwrap_or_default();
+                if !mock_writable_path(&path) {
+                    send_error(&mut stream, "fs_hash_bad_path");
+                    continue;
+                }
+                let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                let path = normalized_mock_path(&path);
+                let Some(data) = st.applied.get(&path) else {
+                    let error = if mock_directories(&st).contains(&path) {
+                        "fs_hash_not_regular_file"
+                    } else {
+                        "fs_hash_stat_failed"
+                    };
+                    send_error(&mut stream, error);
+                    continue;
+                };
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let hash: String = ps5upload_core::hash_shard(data)
+                    .into_iter()
+                    .flat_map(|byte| {
+                        [
+                            char::from(HEX[(byte >> 4) as usize]),
+                            char::from(HEX[(byte & 15) as usize]),
+                        ]
+                    })
+                    .collect();
+                let response = format!(
+                    r#"{{"path":"{}","size":{},"hash":"{hash}"}}"#,
+                    json_escape(&path),
+                    data.len()
+                );
+                drop(st);
+                send_frame(&mut stream, FrameType::FsHashAck, response.as_bytes());
+            }
+            FrameType::FsDelete => {
+                let mut body = vec![0; hdr.body_len as usize];
+                if !read_exact(&mut stream, &mut body) {
+                    return;
+                }
+                let json = String::from_utf8_lossy(&body);
+                let path = extract_json_str(&json, "path").unwrap_or_default();
+                if !mock_writable_path(&path) {
+                    send_error(&mut stream, "fs_delete_path_not_allowed");
+                    continue;
+                }
+                let path = normalized_mock_path(&path);
+                let prefix = format!("{path}/");
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                // Persist parents before removing children, just like unlink:
+                // deleting a file does not implicitly remove its directory.
+                st.dirs = mock_directories(&st);
+                st.applied
+                    .retain(|p, _| p != &path && !p.starts_with(&prefix));
+                st.dirs.retain(|p| p != &path && !p.starts_with(&prefix));
+                drop(st);
+                send_frame(&mut stream, FrameType::FsDeleteAck, b"");
             }
 
             // ── BEGIN_TX ───────────────────────────────────────────────────────
@@ -786,6 +933,44 @@ fn handle_connection_inner(mut stream: TcpStream, state: Arc<Mutex<MockState>>) 
                 send_error(&mut stream, "unsupported_frame");
             }
         }
+    }
+}
+
+fn normalized_mock_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn mock_directories(state: &MockState) -> BTreeSet<String> {
+    let mut dirs = state.dirs.clone();
+    dirs.insert("/".into());
+    for path in state.applied.keys().chain(&state.dirs) {
+        for (index, _) in path.match_indices('/').skip(1) {
+            dirs.insert(path[..index].to_string());
+        }
+    }
+    dirs
+}
+
+fn mock_writable_path(path: &str) -> bool {
+    if !path.starts_with('/') || path.split('/').any(|c| c == "." || c == "..") {
+        return false;
+    }
+    let mut components = path.split('/').filter(|c| !c.is_empty());
+    match (components.next(), components.next()) {
+        (Some("data" | "user"), _) => true,
+        (Some("mnt"), Some(volume)) => ["ext", "usb"].iter().any(|prefix| {
+            volume.strip_prefix(prefix).is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() <= 2
+                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }),
+        _ => false,
     }
 }
 

@@ -255,6 +255,8 @@ pub fn run() {
             commands::profile_apply_avatar,
             commands::transfer_dir_reconcile,
             commands::transfer_dir_diff_preview,
+            commands::sync_preview,
+            commands::sync_run,
             commands::transfer_download,
             commands::transfer_download_zip,
             commands::ps5_fs_delete,

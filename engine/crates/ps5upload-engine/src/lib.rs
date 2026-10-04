@@ -93,6 +93,11 @@ use ps5upload_core::{
     process_mgr::{process_kill, process_list, ProcessKillAck, ProcessListResult},
     saves::{list_saves, list_screenshots, list_videos, SaveList, ScreenshotList},
     smp::{collect_status as smp_collect_status, SmpStatus},
+    sync::{
+        acquire_sync_gate, apply_deletes, apply_deletes_with_progress, load_manifest, plan_sync,
+        resolve_verifications, save_manifest, sync_dest_too_broad, sync_source_empty,
+        walk_local_sync, walk_remote_sync, SyncDelete, SyncDeleteFailure, SyncManifest, SyncPlan,
+    },
     sys_time::{
         humanize_err as sys_time_humanize, ps5_time_get, ps5_time_set, PsTime, PsTimeSetResult,
     },
@@ -206,6 +211,17 @@ pub(crate) struct JobStage {
     pub total: u64,
 }
 
+/// Folder-sync-only terminal details; absent from every existing transfer job.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SyncSummary {
+    deleted_count: u64,
+    deleted_bytes: u64,
+    delete_skipped: Vec<String>,
+    delete_failed: Vec<SyncDeleteFailure>,
+    verified_count: u64,
+    manifest_saved: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum JobState {
@@ -306,6 +322,8 @@ pub(crate) enum JobState {
         /// extra round-trip.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         commit_ack: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sync: Option<SyncSummary>,
     },
     Failed {
         started_at_ms: u64,
@@ -995,6 +1013,7 @@ fn spawn_progress_ticker(
                         files_processing: fp,
                         files_finalized: ff,
                         bytes_finalized: bf,
+                        stage,
                         ..
                     }) => {
                         *b = bytes_sent;
@@ -1005,6 +1024,10 @@ fn spawn_progress_ticker(
                         *fp = files_processing;
                         *ff = files_finalized;
                         *bf = bytes_finalized;
+                        if let Some(stage) = stage.as_mut().filter(|stage| stage.id == "upload") {
+                            stage.done = bytes_sent;
+                            stage.total = total_bytes;
+                        }
                         // Clone once for the SSE broadcast path; the
                         // lock-held section stays short.
                         Some(g.get(&job_id).cloned())
@@ -1453,6 +1476,71 @@ struct TransferDirReconcileReq {
     /// → single-stream (unchanged behaviour). See docs/multistream-upload.md.
     #[serde(default)]
     streams: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SyncPreviewReq {
+    addr: Option<String>,
+    src_dir: String,
+    dest_root: String,
+    #[serde(default)]
+    excludes: Vec<String>,
+    #[serde(default)]
+    verify: bool,
+}
+
+#[derive(Deserialize)]
+struct SyncRunReq {
+    #[serde(flatten)]
+    preview: SyncPreviewReq,
+    approved_deletes: Vec<String>,
+    bandwidth_cap_mbps: Option<f64>,
+    streams: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct SyncPreview {
+    busy: bool,
+    has_manifest: bool,
+    to_send_count: u64,
+    to_send_bytes: u64,
+    sample_to_send: Vec<String>,
+    to_verify_count: u64,
+    to_verify_bytes: u64,
+    unchanged_count: u64,
+    unchanged_bytes: u64,
+    to_delete: Vec<SyncDelete>,
+    delete_bytes: u64,
+    delete_files: u64,
+    kept_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocked: Vec<String>,
+}
+
+impl SyncPreview {
+    fn from_plan(plan: SyncPlan, has_manifest: bool, busy: bool) -> Self {
+        Self {
+            busy,
+            has_manifest,
+            to_send_count: plan.to_send.len() as u64,
+            to_send_bytes: plan.bytes_to_send,
+            sample_to_send: plan
+                .to_send
+                .iter()
+                .take(64)
+                .map(|f| f.rel_path.clone())
+                .collect(),
+            to_verify_count: plan.to_verify.len() as u64,
+            to_verify_bytes: plan.bytes_to_verify,
+            unchanged_count: plan.unchanged_count,
+            unchanged_bytes: plan.unchanged_bytes,
+            delete_bytes: plan.to_delete.iter().map(|d| d.bytes).sum(),
+            delete_files: plan.to_delete.iter().map(|d| d.files).sum(),
+            to_delete: plan.to_delete,
+            kept_count: plan.kept_count,
+            blocked: plan.blocked,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -4876,6 +4964,7 @@ async fn transfer_file_handler(
                         skipped_files: skipped_files_count,
                         skipped_bytes: skipped_bytes_count,
                         commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
+                        sync: None,
                     },
                 )
             }
@@ -5167,6 +5256,7 @@ async fn transfer_dir_handler(
                         skipped_files: skipped_files_count,
                         skipped_bytes: skipped_bytes_count,
                         commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
+                        sync: None,
                     },
                 )
             }
@@ -5694,6 +5784,7 @@ async fn transfer_zip_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
+                        sync: None,
                     },
                 )
             }
@@ -7163,6 +7254,7 @@ async fn transfer_7z_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
+                        sync: None,
                     },
                 )
             }
@@ -7388,6 +7480,7 @@ async fn transfer_rar_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
+                        sync: None,
                     },
                 )
             }
@@ -7628,6 +7721,7 @@ async fn transfer_file_list_handler(
                         skipped_files: skipped_files_count,
                         skipped_bytes: skipped_bytes_count,
                         commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
+                        sync: None,
                     },
                 )
             }
@@ -7923,6 +8017,7 @@ async fn transfer_download_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: None,
+                        sync: None,
                     },
                 );
             }
@@ -8119,6 +8214,7 @@ async fn transfer_download_zip_handler(
                         skipped_files: 0,
                         skipped_bytes: 0,
                         commit_ack: None,
+                        sync: None,
                     },
                 );
             }
@@ -8432,6 +8528,7 @@ async fn transfer_dir_reconcile_handler(
                     skipped_files: skipped_files_count,
                     skipped_bytes: skipped_bytes_count,
                     commit_ack: None,
+                    sync: None,
                 },
             );
             fail_guard.mark_succeeded();
@@ -8569,6 +8666,7 @@ async fn transfer_dir_reconcile_handler(
                         skipped_files: skipped_files_count,
                         skipped_bytes: skipped_bytes_count,
                         commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
+                        sync: None,
                     },
                 )
             }
@@ -8585,6 +8683,454 @@ async fn transfer_dir_reconcile_handler(
         fail_guard.mark_succeeded();
     });
 
+    (
+        StatusCode::ACCEPTED,
+        Json(JobCreated {
+            job_id: job_id.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+// ── Folder sync ─────────────────────────────────────────────────────────────
+
+fn sync_manifest_location(
+    addr: &str,
+    src_dir: &str,
+    dest_root: &str,
+) -> (String, Option<std::path::PathBuf>) {
+    let host = addr
+        .parse::<std::net::SocketAddr>()
+        .map(|socket| socket.ip().to_string())
+        .unwrap_or_else(|_| {
+            addr.rsplit_once(':')
+                .map_or(addr, |(host, _)| host)
+                .trim_matches(['[', ']'])
+                .to_string()
+        });
+    let Some(dir) = remote::store::data_dir() else {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            crate::log_warn!("sync: no data directory; manifests are unavailable");
+        }
+        return (host, None);
+    };
+    let mut key = blake3::Hasher::new();
+    key.update(host.as_bytes());
+    key.update(b"\0");
+    key.update(src_dir.as_bytes());
+    key.update(b"\0");
+    key.update(dest_root.as_bytes());
+    let path = dir
+        .join("sync-manifests")
+        .join(format!("{}.json", key.finalize().to_hex()));
+    (host, Some(path))
+}
+
+fn sync_manifest_for_pair(
+    path: Option<&std::path::Path>,
+    host: &str,
+    src_dir: &str,
+    dest_root: &str,
+) -> Option<SyncManifest> {
+    let manifest = load_manifest(path?)?;
+    if manifest.host == host && manifest.src_dir == src_dir && manifest.dest_root == dest_root {
+        Some(manifest)
+    } else {
+        crate::log_warn!("sync: manifest identity does not match this pair; verifying without it");
+        None
+    }
+}
+
+fn sync_stage(id: &str, index: u32, done: u64, total: u64) -> JobStage {
+    JobStage {
+        id: id.into(),
+        index,
+        count: 3,
+        done,
+        total,
+    }
+}
+
+fn update_sync_stage(
+    jobs: &Arc<Mutex<HashMap<Uuid, JobState>>>,
+    events_tx: &broadcast::Sender<String>,
+    job_id: Uuid,
+    next: JobStage,
+) {
+    let snapshot = {
+        let mut jobs = jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job @ JobState::Running { .. }) = jobs.get_mut(&job_id) else {
+            return;
+        };
+        if let JobState::Running {
+            stage,
+            bytes_sent,
+            total_bytes,
+            files,
+            ..
+        } = job
+        {
+            if next.id == "delete" {
+                *bytes_sent = *total_bytes;
+                // The UI has already received the upload list; retaining it in
+                // every per-entry deletion snapshot would clone the full delta.
+                files.clear();
+            }
+            *stage = Some(next);
+        }
+        job.clone()
+    };
+    let _ = events_tx
+        .send(serde_json::json!({ "job_id": job_id.to_string(), "job": snapshot }).to_string());
+}
+
+/// Preview only inventories and plans: it never hashes, transfers, or deletes.
+async fn sync_preview_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SyncPreviewReq>,
+) -> impl IntoResponse {
+    if sync_dest_too_broad(&req.dest_root) {
+        return json_err(StatusCode::BAD_REQUEST, "sync_dest_too_broad").into_response();
+    }
+    let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<SyncPreview> {
+        let src = std::path::PathBuf::from(&req.src_dir);
+        let mgmt = mgmt_addr_for(&addr);
+        let _gate = acquire_sync_gate(&mgmt, &src, false)?;
+        let local = walk_local_sync(&src, &req.excludes)?;
+        // Same refusal as the run: an empty source (unmounted drive, launcher
+        // mid-reinstall) would otherwise preview the whole PS5 copy for deletion.
+        if sync_source_empty(&local) {
+            anyhow::bail!("sync_source_empty");
+        }
+        let remote = walk_remote_sync(&mgmt, &req.dest_root)?;
+        let (host, path) = sync_manifest_location(&addr, &req.src_dir, &req.dest_root);
+        let manifest = sync_manifest_for_pair(path.as_deref(), &host, &req.src_dir, &req.dest_root);
+        let plan = plan_sync(
+            &local,
+            &remote,
+            manifest.as_ref(),
+            &req.excludes,
+            req.verify,
+        );
+        Ok(SyncPreview::from_plan(plan, manifest.is_some(), false))
+    })
+    .await;
+    match result {
+        Ok(Ok(preview)) => (StatusCode::OK, Json(preview)).into_response(),
+        Ok(Err(e)) if e.to_string().contains("reconcile_busy") => (
+            StatusCode::OK,
+            Json(SyncPreview::from_plan(SyncPlan::default(), false, true)),
+        )
+            .into_response(),
+        Ok(Err(e)) => json_err(StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+        Err(e) => json_err(StatusCode::BAD_REQUEST, format!("sync task: {e}")).into_response(),
+    }
+}
+
+/// Re-plan under the reconcile gate rather than trusting the earlier preview.
+/// Only structural conflicts explicitly approved by the user may be removed
+/// before upload; all ordinary deletions wait until upload has succeeded.
+async fn sync_run_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SyncRunReq>,
+) -> impl IntoResponse {
+    if sync_dest_too_broad(&req.preview.dest_root) {
+        return json_err(StatusCode::BAD_REQUEST, "sync_dest_too_broad").into_response();
+    }
+    let SyncRunReq {
+        preview: mut req,
+        approved_deletes,
+        bandwidth_cap_mbps,
+        streams,
+    } = req;
+    let addr = req
+        .addr
+        .take()
+        .unwrap_or_else(|| state.default_ps5_addr.clone());
+    let job_id = Uuid::new_v4();
+    let started_at_ms = now_ms();
+    // Register before planning so cancel also works while waiting for the gate.
+    let cancel = register_transfer_cancel(job_id);
+    set_job(
+        &state.jobs,
+        &state.events_tx,
+        job_id,
+        JobState::Running {
+            started_at_ms,
+            bytes_sent: 0,
+            total_bytes: 0,
+            files: vec![],
+            skipped_files: 0,
+            skipped_bytes: 0,
+            files_processing: 0,
+            files_finalized: 0,
+            files_finalizing_total: 0,
+            bytes_finalized: 0,
+            stage: Some(sync_stage("plan", 0, 0, 0)),
+        },
+    );
+    let jobs = Arc::clone(&state.jobs);
+    let events_tx = state.events_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut fail_guard =
+            JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
+        let result = (|| -> anyhow::Result<Option<JobState>> {
+            let src = std::path::PathBuf::from(&req.src_dir);
+            let mgmt = mgmt_addr_for(&addr);
+            let _gate = acquire_sync_gate(&mgmt, &src, true)?;
+            let local = walk_local_sync(&src, &req.excludes)?;
+            if sync_source_empty(&local) {
+                anyhow::bail!("sync_source_empty");
+            }
+            let remote = walk_remote_sync(&mgmt, &req.dest_root)?;
+            let (host, manifest_path) = sync_manifest_location(&addr, &req.src_dir, &req.dest_root);
+            let manifest = sync_manifest_for_pair(
+                manifest_path.as_deref(),
+                &host,
+                &req.src_dir,
+                &req.dest_root,
+            );
+            let mut plan = plan_sync(
+                &local,
+                &remote,
+                manifest.as_ref(),
+                &req.excludes,
+                req.verify,
+            );
+            if !plan.blocked.is_empty() {
+                anyhow::bail!(
+                    "sync_conflict_protected: {}",
+                    plan.blocked[..plan.blocked.len().min(8)].join(", "),
+                );
+            }
+            let verified_count =
+                resolve_verifications(&mgmt, &src, &req.dest_root, &mut plan, |done, total| {
+                    update_sync_stage(
+                        &jobs,
+                        &events_tx,
+                        job_id,
+                        sync_stage("plan", 0, done, total),
+                    )
+                });
+            let approved: std::collections::BTreeSet<&str> =
+                approved_deletes.iter().map(String::as_str).collect();
+            let unapproved_conflicts: Vec<&str> = plan
+                .to_delete
+                .iter()
+                .filter(|entry| entry.blocks_upload && !approved.contains(entry.path.as_str()))
+                .map(|entry| entry.path.as_str())
+                .collect();
+            if !unapproved_conflicts.is_empty() {
+                anyhow::bail!(
+                    "sync_conflict_not_approved: {}",
+                    unapproved_conflicts.join(", ")
+                );
+            }
+            if cancel.load(Ordering::Acquire) {
+                anyhow::bail!("transfer_cancelled");
+            }
+            if !plan.to_send.is_empty()
+                && fail_job_if_capacity_insufficient(
+                    &jobs,
+                    &events_tx,
+                    job_id,
+                    started_at_ms,
+                    &addr,
+                    &req.dest_root,
+                    plan.bytes_to_send,
+                    false,
+                )
+            {
+                return Ok(None); // capacity helper already published Failed
+            }
+            let (conflicts, ordinary): (Vec<_>, Vec<_>) = std::mem::take(&mut plan.to_delete)
+                .into_iter()
+                .partition(|entry| entry.blocks_upload);
+            let mut deleted = apply_deletes(
+                &mgmt,
+                &req.dest_root,
+                &conflicts,
+                &approved_deletes,
+                &cancel,
+            );
+            if !deleted.failed.is_empty() {
+                anyhow::bail!(
+                    "sync_conflict_delete_failed: {}",
+                    deleted
+                        .failed
+                        .iter()
+                        .map(|f| format!("{}: {}", f.path, f.error))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
+            }
+            if cancel.load(Ordering::Acquire) {
+                anyhow::bail!("transfer_cancelled");
+            }
+            let files_sent = plan.to_send.len() as u64;
+            set_job(
+                &jobs,
+                &events_tx,
+                job_id,
+                JobState::Running {
+                    started_at_ms,
+                    bytes_sent: 0,
+                    total_bytes: plan.bytes_to_send,
+                    files: plan
+                        .to_send
+                        .iter()
+                        .map(|file| PlannedFile {
+                            rel_path: file.rel_path.clone(),
+                            size: file.size,
+                        })
+                        .collect(),
+                    skipped_files: plan.unchanged_count,
+                    skipped_bytes: plan.unchanged_bytes,
+                    files_processing: 0,
+                    files_finalized: 0,
+                    files_finalizing_total: 0,
+                    bytes_finalized: 0,
+                    stage: Some(sync_stage("upload", 1, 0, plan.bytes_to_send)),
+                },
+            );
+            let transfer = if plan.to_send.is_empty() {
+                None
+            } else {
+                let progress = Arc::new(AtomicU64::new(0));
+                let progress_files = Arc::new(AtomicU64::new(0));
+                let progress_files_finalized = Arc::new(AtomicU64::new(0));
+                let progress_bytes_finalized = Arc::new(AtomicU64::new(0));
+                let ticker = spawn_progress_ticker(
+                    Arc::clone(&jobs),
+                    events_tx.clone(),
+                    job_id,
+                    TickerContext {
+                        started_at_ms,
+                        total_bytes: plan.bytes_to_send,
+                        dynamic_total_bytes: None,
+                        skipped_files: plan.unchanged_count,
+                        skipped_bytes: plan.unchanged_bytes,
+                    },
+                    Arc::clone(&progress),
+                    Arc::clone(&progress_files),
+                    Arc::clone(&progress_files_finalized),
+                    Arc::clone(&progress_bytes_finalized),
+                );
+                let _ticker_guard = TickerStopGuard::new(ticker);
+                let entries: Vec<FileListEntry> = plan
+                    .to_send
+                    .iter()
+                    .map(|file| FileListEntry {
+                        src: src
+                            .join(file.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+                            .to_string_lossy()
+                            .into_owned(),
+                        dest: format!("{}/{}", req.dest_root.trim_end_matches('/'), file.rel_path),
+                    })
+                    .collect();
+                let mut cfg = make_transfer_config(&addr);
+                cfg.cancel = Some(Arc::clone(&cancel));
+                cfg.excludes = req.excludes;
+                cfg.progress_bytes = Some(progress);
+                cfg.progress_files = Some(progress_files);
+                cfg.progress_files_finalized = Some(progress_files_finalized);
+                cfg.progress_bytes_finalized = Some(progress_bytes_finalized);
+                apply_per_request_bandwidth(&mut cfg, bandwidth_cap_mbps);
+                // Same stream orchestration, resume policy and apply progress
+                // as reconcile's delta upload; no transfer fallback on errors.
+                Some(transfer_file_list_multistream(
+                    &cfg,
+                    *Uuid::new_v4().as_bytes(),
+                    &req.dest_root,
+                    &entries,
+                    streams.unwrap_or(1),
+                    DEFAULT_RESUME_RETRIES,
+                    0,
+                )?)
+            };
+
+            // Capture pre-upload mtimes, not a second walk that could incorrectly
+            // remember launcher edits made while the upload was in flight.
+            let next_manifest = SyncManifest {
+                version: 1,
+                src_dir: req.src_dir,
+                dest_root: req.dest_root.clone(),
+                host,
+                files: local.files,
+            };
+            let manifest_saved = manifest_path.as_deref().is_some_and(|path| {
+                match save_manifest(path, &next_manifest) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::log_warn!("sync: saving manifest failed: {e:#}");
+                        false
+                    }
+                }
+            });
+            let remaining = apply_deletes_with_progress(
+                &mgmt,
+                &req.dest_root,
+                &ordinary,
+                &approved_deletes,
+                &cancel,
+                |done, total| {
+                    update_sync_stage(
+                        &jobs,
+                        &events_tx,
+                        job_id,
+                        sync_stage("delete", 2, done, total),
+                    )
+                },
+            );
+            deleted.deleted.extend(remaining.deleted);
+            deleted.skipped.extend(remaining.skipped);
+            deleted.failed.extend(remaining.failed);
+            let (tx_id_hex, shards_sent, bytes_sent, commit_ack) = match transfer {
+                Some(result) => (
+                    result.tx_id_hex,
+                    result.shards_sent,
+                    result.bytes_sent,
+                    serde_json::from_str(&result.commit_ack_body).ok(),
+                ),
+                None => (String::new(), 0, 0, None),
+            };
+            let completed_at_ms = now_ms();
+            Ok(Some(JobState::Done {
+                started_at_ms,
+                completed_at_ms,
+                elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+                tx_id_hex,
+                shards_sent,
+                bytes_sent,
+                dest: req.dest_root,
+                files_sent,
+                skipped_files: plan.unchanged_count,
+                skipped_bytes: plan.unchanged_bytes,
+                commit_ack,
+                sync: Some(SyncSummary {
+                    deleted_count: deleted.deleted.len() as u64,
+                    deleted_bytes: deleted.deleted.iter().map(|entry| entry.bytes).sum(),
+                    delete_skipped: deleted.skipped,
+                    delete_failed: deleted.failed,
+                    verified_count,
+                    manifest_saved,
+                }),
+            }))
+        })();
+        match result {
+            Ok(Some(done)) => set_job(&jobs, &events_tx, job_id, done),
+            Ok(None) => {} // capacity preflight already set the terminal state
+            Err(e) => set_job(
+                &jobs,
+                &events_tx,
+                job_id,
+                job_failed_from_err(started_at_ms, now_ms(), &e),
+            ),
+        }
+        fail_guard.mark_succeeded();
+    });
     (
         StatusCode::ACCEPTED,
         Json(JobCreated {
@@ -9371,6 +9917,8 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             "/api/transfer/dir-diff-preview",
             post(transfer_dir_diff_preview_handler),
         )
+        .route("/api/sync/preview", post(sync_preview_handler))
+        .route("/api/sync/run", post(sync_run_handler))
         .route("/api/version", get(engine_version))
         .route("/api/jobs", get(list_jobs))
         .route("/api/bug-report/bundle", post(bug_report_bundle_handler))
@@ -10574,5 +11122,199 @@ mod appdb_installed_additions_tests {
         let rows = vec![("PLDM00001".to_string(), "Payload Manager".to_string())];
         let got = appdb_installed_additions(&rows, &set(&["PLDM00001"]), &set(&["PLDM00001"]));
         assert!(got.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sync_http_tests {
+    use super::*;
+
+    fn state() -> AppState {
+        let (events_tx, _) = broadcast::channel(16);
+        AppState {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            default_ps5_addr: "192.0.2.73:9113".into(),
+            events_tx,
+        }
+    }
+
+    fn request(src_dir: String, dest_root: &str) -> SyncPreviewReq {
+        SyncPreviewReq {
+            addr: None,
+            src_dir,
+            dest_root: dest_root.into(),
+            excludes: vec![],
+            verify: false,
+        }
+    }
+
+    async fn body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn preview_busy_returns_zero_counts_before_source_walk() {
+        let state = state();
+        let src = std::env::temp_dir().join(format!("sync-missing-{}", Uuid::new_v4()));
+        let _gate = acquire_sync_gate(&mgmt_addr_for(&state.default_ps5_addr), &src, true).unwrap();
+        let response = sync_preview_handler(
+            State(state),
+            Json(request(
+                src.to_string_lossy().into_owned(),
+                "/data/homebrew/Game",
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = body(response).await;
+        assert_eq!(result["busy"], true);
+        assert_eq!(result["has_manifest"], false);
+        for name in [
+            "to_send_count",
+            "to_send_bytes",
+            "to_verify_count",
+            "to_verify_bytes",
+            "unchanged_count",
+            "unchanged_bytes",
+            "delete_bytes",
+            "delete_files",
+            "kept_count",
+        ] {
+            assert_eq!(result[name], 0, "{name}");
+        }
+        assert_eq!(result["sample_to_send"], serde_json::json!([]));
+        assert_eq!(result["to_delete"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn preview_and_run_reject_broad_destinations_without_starting_jobs() {
+        let state = state();
+        let preview = sync_preview_handler(
+            State(state.clone()),
+            Json(request("/missing/source".into(), "/data/")),
+        )
+        .await
+        .into_response();
+        assert_eq!(preview.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(preview).await["error"], "sync_dest_too_broad");
+        let run = sync_run_handler(
+            State(state.clone()),
+            Json(SyncRunReq {
+                preview: request("/missing/source".into(), "/mnt/usb0"),
+                approved_deletes: vec!["file".into()],
+                bandwidth_cap_mbps: None,
+                streams: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(run.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(run).await["error"], "sync_dest_too_broad");
+        assert!(state
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_source_run_fails_before_contacting_console() {
+        let state = state();
+        let src = std::env::temp_dir().join(format!("sync-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir(&src).unwrap();
+        let response = sync_run_handler(
+            State(state.clone()),
+            Json(SyncRunReq {
+                preview: request(src.to_string_lossy().into_owned(), "/data/homebrew/Game"),
+                approved_deletes: vec!["old.bin".into()],
+                bandwidth_cap_mbps: None,
+                streams: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let id: Uuid = body(response).await["job_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let job = state
+                    .jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&id)
+                    .cloned();
+                if let Some(job @ (JobState::Done { .. } | JobState::Failed { .. })) = job {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir(&src).unwrap();
+        assert!(matches!(job, JobState::Failed { error, .. } if error == "sync_source_empty"));
+    }
+
+    #[tokio::test]
+    async fn empty_source_preview_refuses_instead_of_listing_everything_for_deletion() {
+        let src = std::env::temp_dir().join(format!("sync-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir(&src).unwrap();
+        // Own console address: the reconcile gate is process-global and the
+        // busy-preview test holds the default console's key concurrently.
+        let mut req = request(src.to_string_lossy().into_owned(), "/data/homebrew/Game");
+        req.addr = Some("192.0.2.99:9113".into());
+        let response = sync_preview_handler(State(state()), Json(req))
+            .await
+            .into_response();
+        std::fs::remove_dir(&src).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(response).await["error"], "sync_source_empty");
+    }
+
+    #[test]
+    fn preview_samples_are_bounded_and_conflicts_are_explicit() {
+        let plan = SyncPlan {
+            to_send: (0..100)
+                .map(|i| ReconcileFile {
+                    rel_path: format!("f{i}"),
+                    size: 1,
+                })
+                .collect(),
+            bytes_to_send: 100,
+            to_delete: vec![
+                SyncDelete {
+                    path: "conflict".into(),
+                    kind: "dir".into(),
+                    bytes: 7,
+                    files: 2,
+                    blocks_upload: true,
+                },
+                SyncDelete {
+                    path: "old".into(),
+                    kind: "file".into(),
+                    bytes: 3,
+                    files: 1,
+                    blocks_upload: false,
+                },
+            ],
+            blocked: vec!["protected".into()],
+            ..Default::default()
+        };
+        let preview = serde_json::to_value(SyncPreview::from_plan(plan, true, false)).unwrap();
+        assert_eq!(preview["to_send_count"], 100);
+        assert_eq!(preview["sample_to_send"].as_array().unwrap().len(), 64);
+        assert_eq!(preview["delete_bytes"], 10);
+        assert_eq!(preview["delete_files"], 3);
+        assert_eq!(preview["to_delete"][0]["blocks_upload"], true);
+        assert!(preview["to_delete"][1].get("blocks_upload").is_none());
+        assert_eq!(preview["blocked"], serde_json::json!(["protected"]));
     }
 }

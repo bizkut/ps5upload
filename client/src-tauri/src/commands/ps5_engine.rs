@@ -1660,6 +1660,34 @@ pub struct TransferDirReconcileReq {
     pub streams: Option<usize>,
 }
 
+/// One-way folder sync preview. The engine reports the full deletion list
+/// without changing either folder, so the client can ask for approval.
+#[derive(Debug, Deserialize)]
+pub struct SyncPreviewReq {
+    pub src_dir: String,
+    pub dest_root: String,
+    pub addr: Option<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    #[serde(default)]
+    pub verify: bool,
+}
+
+/// A sync run only deletes paths explicitly approved from its preview.
+#[derive(Debug, Deserialize)]
+pub struct SyncRunReq {
+    pub src_dir: String,
+    pub dest_root: String,
+    pub addr: Option<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    #[serde(default)]
+    pub verify: bool,
+    pub approved_deletes: Vec<String>,
+    pub bandwidth_cap_mbps: Option<f64>,
+    pub streams: Option<usize>,
+}
+
 // ── Destructive FS ops ──────────────────────────────────────────────────────
 //
 // Thin wrappers over the engine's /api/ps5/fs/* endpoints. Each one
@@ -2339,6 +2367,37 @@ pub async fn transfer_dir_reconcile(req: TransferDirReconcileReq) -> Result<Json
         "tx_id": req.tx_id,
         "mode": req.mode,
         "excludes": req.excludes,
+        "bandwidth_cap_mbps": req.bandwidth_cap_mbps,
+        "streams": req.streams,
+    });
+    post_json(&url, &body).await
+}
+
+#[tauri::command]
+pub async fn sync_preview(req: SyncPreviewReq) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let url = format!("{base}/api/sync/preview");
+    let body = serde_json::json!({
+        "src_dir": req.src_dir,
+        "dest_root": req.dest_root,
+        "addr": req.addr,
+        "excludes": req.excludes,
+        "verify": req.verify,
+    });
+    post_json(&url, &body).await
+}
+
+#[tauri::command]
+pub async fn sync_run(req: SyncRunReq) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let url = format!("{base}/api/sync/run");
+    let body = serde_json::json!({
+        "src_dir": req.src_dir,
+        "dest_root": req.dest_root,
+        "addr": req.addr,
+        "excludes": req.excludes,
+        "verify": req.verify,
+        "approved_deletes": req.approved_deletes,
         "bandwidth_cap_mbps": req.bandwidth_cap_mbps,
         "streams": req.streams,
     });

@@ -16,6 +16,7 @@ import type { LucideIcon } from "lucide-react";
 import {
   Cable,
   Upload,
+  RefreshCw,
   PackageOpen,
   Gamepad2,
   Search,
@@ -103,6 +104,12 @@ export const NAV_ITEMS: NavItem[] = [
     fallback: "Upload",
     icon: Upload,
     section: { key: "nav_section_files", fallback: "Files & storage" },
+  },
+  {
+    to: "/sync",
+    key: "sync_title",
+    fallback: "Folder Sync",
+    icon: RefreshCw,
   },
   {
     to: "/files",

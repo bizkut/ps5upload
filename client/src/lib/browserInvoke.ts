@@ -1077,6 +1077,12 @@ export async function browserInvoke<T>(
         /*long=*/ true,
       );
 
+    case "sync_preview":
+      return postJson<T>("/api/sync/preview", args["req"]);
+
+    case "sync_run":
+      return postJson<T>("/api/sync/run", args["req"], /*long=*/ true);
+
     // Host-filesystem helpers. The desktop app answers these in-process
     // via Tauri commands; in the browser the "host" is the engine's own
     // machine, which is exactly what the Upload screen browses there.
