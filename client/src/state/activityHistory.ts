@@ -29,6 +29,7 @@ export type ActivityKind =
   | "upload-dir"
   | "upload-reconcile"
   | "upload-queue"
+  | "folder-sync"
   | "download"
   | "fs-delete"
   | "fs-paste-copy"

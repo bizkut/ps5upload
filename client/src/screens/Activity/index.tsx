@@ -24,6 +24,7 @@ import {
   useActivityHistoryStore,
   type ActivityEntry,
   type ActivityOutcome,
+  type ActivityKind,
 } from "../../state/activityHistory";
 import { formatBytes, formatDuration } from "../../lib/format";
 import { averageRate } from "../../lib/rollingRate";
@@ -33,6 +34,7 @@ import { useFsBulkOpStore, useFsDownloadOpStore } from "../../state/fsBulkOp";
 import { useTransferStore } from "../../state/transfer";
 import { useUploadQueueStore } from "../../state/uploadQueue";
 import { useTaskStore } from "../../state/tasks";
+import { useSyncPairsStore } from "../../state/syncPairs";
 import { profileNameForAddr, useRosterStore } from "../../state/roster";
 import { ConsoleChip } from "../../components/ConsoleChip";
 
@@ -258,7 +260,9 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
   // which the engine extracts to a host temp dir BEFORE any transfer) this is
   // the long silent prep phase that used to read as a misleading "Uploading N
   // files" with no speed. Surface it honestly. Gate on running + zero bytes.
-  const preparing = isRunning && entry.phase !== "finalizing" && !entry.bytes;
+  const preparing = isRunning && isUploadKind(entry.kind) && entry.phase !== "finalizing" && !entry.bytes;
+  // These rows stop the operation itself, not just this view of it.
+  const stopCancels = entry.opId !== undefined || entry.kind === "folder-sync";
   // For finished rows we have a fixed end timestamp (pure subtract).
   // For running rows we tick `now` every second so the elapsed
   // counter advances; this also drives the speed/percent re-renders.
@@ -336,6 +340,11 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
       } else {
         useUploadQueueStore.getState().stop();
       }
+    } else if (entry.kind === "folder-sync" && entry.addr) {
+      // One sync per console, so the console identifies the run.
+      const host = hostOf(entry.addr);
+      const run = Object.values(useSyncPairsStore.getState().runs).find((r) => r.host === host);
+      if (run) await useSyncPairsStore.getState().cancelRun(host, run.pairId);
     }
     // library-* ops are component-local; the fsOpCancel call above
     // is the only useful action — the screen's poller will see the
@@ -417,12 +426,12 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
             title={tr(
               "activity_stop_tooltip",
               undefined,
-              entry.opId !== undefined
+              stopCancels
                 ? "Cancel the in-flight operation"
                 : "Stop watching this operation (engine job may continue server-side)",
             )}
           >
-            {entry.opId !== undefined
+            {stopCancels
               ? tr("activity_cancel", undefined, "Cancel")
               : tr("fs_download_stop", undefined, "Stop")}
           </button>
@@ -608,7 +617,7 @@ function ActivityDetailModal({
     ? profileNameForAddr(entry.addr, profiles)
     : null;
   const phaseLabel =
-    entry.outcome === "running" && entry.phase !== "finalizing" && !entry.bytes
+    entry.outcome === "running" && isUploadKind(entry.kind) && entry.phase !== "finalizing" && !entry.bytes
       ? tr("activity_phase_preparing", undefined, "Preparing (no transfer yet)")
       : entry.phase === "finalizing"
         ? tr("activity_phase_finalizing", undefined, "Finalizing on PS5")
@@ -686,6 +695,12 @@ function ActivityDetailModal({
       </div>
     </Modal>
   );
+}
+
+/** Uploads have a silent pre-transfer phase (archive extraction, folder walk)
+ *  worth explaining; other running ops simply have no byte counter. */
+function isUploadKind(kind: ActivityKind): boolean {
+  return kind === "upload" || kind === "upload-dir" || kind === "upload-reconcile" || kind === "upload-queue";
 }
 
 function OutcomeIcon({ outcome }: { outcome: ActivityOutcome }) {

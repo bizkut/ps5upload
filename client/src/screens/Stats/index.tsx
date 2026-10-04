@@ -149,7 +149,7 @@ function computeStats(entries: ActivityEntry[]): ComputedStats {
       durationsCount++;
     }
     const bytes = e.bytes ?? 0;
-    if (e.kind === "upload" || e.kind === "upload-dir" || e.kind === "upload-reconcile") {
+    if (e.kind === "upload" || e.kind === "upload-dir" || e.kind === "upload-reconcile" || e.kind === "folder-sync") {
       uploadedBytes += bytes;
     } else if (e.kind === "download" || e.kind === "library-download") {
       downloadedBytes += bytes;

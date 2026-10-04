@@ -37,12 +37,28 @@ export interface SyncPair extends SyncPairFields {
 
 export interface SyncRun {
   host: string;
+  pairId: string;
   jobId?: string;
   snapshot?: JobSnapshot;
   cancelling: boolean;
   /** A status/cancel request error is not a terminal engine-job failure. */
   error?: string;
   cancelError?: string;
+}
+
+export type SyncRunStageId = "start" | "plan" | "upload" | "delete";
+
+/** Where a run stands, shared by the Sync screen and the Tasks/History wiring.
+ *  `plan` counts files verified, `upload` bytes, `delete` entries. */
+export function syncRunStage(run: SyncRun): { id: SyncRunStageId; done: number; total: number } {
+  if (!run.jobId) return { id: "start", done: 0, total: 0 };
+  const stage = run.snapshot?.stage;
+  const id: SyncRunStageId = stage?.id === "upload" || stage?.id === "delete" ? stage.id : "plan";
+  return {
+    id,
+    done: stage?.done ?? run.snapshot?.bytes_sent ?? 0,
+    total: stage?.total ?? run.snapshot?.total_bytes ?? 0,
+  };
 }
 
 type PairsByHost = Record<string, SyncPair[]>;
@@ -273,7 +289,7 @@ export const useSyncPairsStore = create<SyncPairsState>((set, get) => {
       const pair = get().pairsByHost[host]?.find((entry) => entry.id === id);
       if (!pair || Object.values(get().runs).some((run) => run.host === host)) return;
       const key = syncPairRunKey(host, id);
-      set((state) => ({ runs: { ...state.runs, [key]: { host, cancelling: false } } }));
+      set((state) => ({ runs: { ...state.runs, [key]: { host, pairId: id, cancelling: false } } }));
       let jobId: string;
       try {
         jobId = await startSync(

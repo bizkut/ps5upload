@@ -36,6 +36,7 @@ import {
   Wrench,
   Search,
   Bug,
+  RefreshCw,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -67,6 +68,7 @@ const kindIconMap: Record<TaskKind, typeof Upload> = {
   "upload-file": Upload,
   "upload-dir": Upload,
   "upload-archive": Upload,
+  "folder-sync": RefreshCw,
   "download": Download,
   "fs-delete": FileX,
   "fs-copy": Copy,
@@ -301,9 +303,12 @@ function TaskRow({ task }: { task: Task }) {
 
       {/* Row 4: stats line */}
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[var(--color-muted)]">
+        {task.stage && isActive && <span>{task.stage}</span>}
         {task.progress && task.progress.total > 0 && (
           <span>
-            {formatBytes(task.progress.current)} / {formatBytes(task.progress.total)}
+            {task.progress.unit === "bytes"
+              ? `${formatBytes(task.progress.current)} / ${formatBytes(task.progress.total)}`
+              : `${task.progress.current} / ${task.progress.total}`}
             {pct !== null && ` (${(pct * 100).toFixed(0)}%)`}
           </span>
         )}
