@@ -4,6 +4,14 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 5.42.2
+
+- **Folder Sync speaks your language.** The Sync screen, its confirm
+  dialog and its messages are translated into all 19 other languages;
+  5.42.0 and 5.42.1 showed them in English.
+
+---
+
 ## 5.42.1
 
 - **Folder Sync shows up in Tasks.** A running sync appears in the Tasks
